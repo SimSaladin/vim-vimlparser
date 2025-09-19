@@ -91,6 +91,7 @@ pat_vim2py = {
     r"^\.[0-9A-Fa-f]$": r"^\.[0-9A-Fa-f]$",
     "^[0-9A-Fa-f][^0-9A-Fa-f]$": "^[0-9A-Fa-f][^0-9A-Fa-f]$",
     "^[^a-z]\\S\\+$": "^[^a-z]\\S\\+$",
+    "^<SKIP>:": "^<SKIP>:",
 }
 
 
@@ -124,6 +125,9 @@ def viml_eqregh(s, reg):
 
 def viml_eqregq(s, reg):
     return re.search(pat_vim2py[reg], s, re.IGNORECASE)
+
+def viml_substitute(s, reg, repl, flags):
+    return re.sub(pat_vim2py[reg], repl, s)
 
 
 def viml_escape(s, chars):
@@ -311,6 +315,8 @@ NODE_EVAL = 95
 NODE_HEREDOC = 96
 NODE_METHOD = 97
 NODE_ECHOCONSOLE = 98
+NODE_CURLYSTRING = 99
+NODE_CURLYSTRINGEXPR = 100
 TOKEN_EOF = 1
 TOKEN_EOL = 2
 TOKEN_SPACE = 3
@@ -1491,6 +1497,7 @@ class VimLParser:
         node.body = []
         # allow prefix to precede heredoc end marker if true
         is_trim = FALSE
+        is_eval = FALSE
         while TRUE:
             self.reader.skip_white()
             pos = self.reader.getpos()
@@ -1507,21 +1514,29 @@ class VimLParser:
                 viml_add(node.rlist, keynode)
                 if key == "trim":
                     is_trim = TRUE
+                elif key == "eval":
+                    is_eval = TRUE
         if node.op == "":
             raise VimLParserException(Err("E172: Missing marker", self.reader.getpos()))
         self.parse_trail()
+        self.reader.join = FALSE
         while TRUE:
             if self.reader.peek() == "<EOF>":
+                self.reader.join = TRUE
                 break
             pos = self.reader.getpos()
             line = self.reader.getn(-1)
             if line == node.op or is_trim and line == prefix + node.op:
                 return node
-            linenode = Node(NODE_STRING)
-            linenode.pos = pos
-            linenode.value = line
+            if not is_eval:
+                linenode = Node(NODE_STRING)
+                linenode.pos = pos
+                linenode.value = line
+                self.reader.get()
+            else:
+                self.reader.setpos(pos)
+                linenode = ExprParser(self.reader).parse_string("", "", TRUE, FALSE)
             viml_add(node.body, linenode)
-            self.reader.get()
         raise VimLParserException(Err(viml_printf("E990: Missing end marker '%s'", node.op), self.reader.getpos()))
 
     def parse_cmd_let(self):
@@ -2297,9 +2312,16 @@ class ExprTokenizer:
             r.seek_cur(1)
             return self.token(TOKEN_DQUOTE, "\"", pos)
         elif c == "$":
-            s = r.getn(1)
-            s += r.read_word()
-            return self.token(TOKEN_ENV, s, pos)
+            if r.p(1) == "\"":
+                r.seek_cur(2)
+                return self.token(TOKEN_DQUOTE, "$\"", pos)
+            elif r.p(1) == "'":
+                r.seek_cur(2)
+                return self.token(TOKEN_SQUOTE, "$'", pos)
+            else:
+                s = r.getn(1)
+                s += r.read_word()
+                return self.token(TOKEN_ENV, s, pos)
         elif c == "@":
             # @<EOL> is treated as @"
             return self.token(TOKEN_REG, r.getn(2), pos)
@@ -2323,7 +2345,7 @@ class ExprTokenizer:
             r.seek_cur(1)
             return self.token(TOKEN_BACKTICK, "`", pos)
         else:
-            raise VimLParserException(Err(viml_printf("unexpected character: %s", c), self.reader.getpos()))
+            raise VimLParserException(Err(viml_printf("get2: unexpected character: %s", c), self.reader.getpos()))
 
     def get_sstring(self):
         self.reader.skip_white()
@@ -2872,6 +2894,8 @@ class ExprParser:
     # expr9: number
     #        "string"
     #        'string'
+    #        $"st{ri}ng"
+    #        $'st{ri}ng'
     #        [expr1, ...]
     #        {expr1: expr1, ...}
     #        #{literal_key1: expr1, ...}
@@ -2896,6 +2920,9 @@ class ExprParser:
             node = Node(NODE_BLOB)
             node.pos = token.pos
             node.value = token.value
+        elif (token.type == TOKEN_DQUOTE or token.type == TOKEN_SQUOTE) and token.value[0] == "$":
+            self.reader.setpos(token.pos)
+            node = self.parse_string(token.value, token.value[viml_len(token.value) - 1], token.value[0] == "$", TRUE)
         elif token.type == TOKEN_DQUOTE:
             self.reader.seek_set(pos)
             node = Node(NODE_STRING)
@@ -3159,6 +3186,86 @@ class ExprParser:
                 break
         return curly_parts
 
+    def parse_string(self, open, quotechr, eval, multiline):
+        parts = []
+        pos = self.reader.getpos()
+        s = open
+        self.reader.seek_cur(viml_len(open))
+        while TRUE:
+            c = self.reader.p(0)
+            if c == "<EOF>":
+                raise VimLParserException(Err("unexpected EOF", self.reader.getpos()))
+            elif c == "<EOL>":
+                if quotechr != "":
+                    raise VimLParserException(Err(viml_printf("string (%s): unexpected EOL", quotechr), self.reader.getpos()))
+                else:
+                    self.reader.seek_cur(1)
+                    break
+            elif c == quotechr:
+                self.reader.seek_cur(1)
+                if self.reader.p(0) == quotechr:
+                    self.reader.seek_cur(1)
+                    s += quotechr + quotechr
+                else:
+                    break
+            elif c == "\\" and quotechr == "\"":
+                self.reader.seek_cur(1)
+                c = self.reader.p(0)
+                if c == "<EOF>" or c == "<EOL>":
+                    raise VimLParserException(Err("ExprTokenizer: unexpected EOL", self.reader.getpos()))
+                self.reader.seek_cur(1)
+                s += "\\" + c
+            elif c == "{" and eval:
+                self.reader.seek_cur(1)
+                if self.reader.p(0) == "{":
+                    self.reader.seek_cur(1)
+                    s += "{{"
+                else:
+                    # literal string part
+                    if not viml_empty(s):
+                        node = Node(NODE_STRING)
+                        node.pos = pos
+                        node.value = s
+                        viml_add(parts, node)
+                        s = ""
+                    # {curlyexpr}
+                    node = Node(NODE_CURLYSTRINGEXPR)
+                    node.pos = self.reader.getpos()
+                    node.value = self.parse_expr1()
+                    viml_add(parts, node)
+                    self.reader.skip_white()
+                    c = self.reader.p(0)
+                    if c != "}":
+                        raise VimLParserException(Err(viml_printf("unexpected token: %s (expected })", c), self.reader.getpos()))
+                    if not multiline and self.reader.getpos().lnum != node.pos.lnum:
+                        raise VimLParserException(Err(viml_printf("interpolated expression in heredoc may not span multiple lines"), node.pos))
+                    self.reader.seek_cur(1)
+                    pos = self.reader.getpos()
+            elif c == "}" and eval:
+                self.reader.seek_cur(1)
+                if self.reader.p(0) != "}":
+                    raise VimLParserException(Err(viml_printf("unexpected character: %s (expected })", c), self.reader.getpos()))
+                self.reader.seek_cur(1)
+                s += "}}"
+            else:
+                self.reader.seek_cur(1)
+                s += c
+        s += quotechr
+        if not viml_empty(s) or viml_len(parts) == 0:
+            # add literal part
+            node = Node(NODE_STRING)
+            node.pos = pos
+            node.value = s
+            viml_add(parts, node)
+        self.tokenizer.reader.seek_set(self.reader.tell())
+        if viml_len(parts) == 1:
+            return parts[0]
+        else:
+            node = Node(NODE_CURLYSTRING)
+            node.pos = parts[0].pos
+            node.value = parts
+            return node
+
 
 class LvalueParser(ExprParser):
 
@@ -3266,6 +3373,7 @@ class StringReader:
     def __init__(self, lines):
         self.buf = []
         self.pos = []
+        self.join = TRUE
         lnum = 0
         offset = 0
         while lnum < viml_len(lines):
@@ -3276,10 +3384,14 @@ class StringReader:
                 col += viml_len(c)
                 offset += viml_len(c)
             while lnum + 1 < viml_len(lines) and viml_eqregh(lines[lnum + 1], "^\\s*\\\\"):
+                viml_add(self.buf, "<SKIP>:<EOL>")
+                viml_add(self.pos, [lnum + 1, col + 1, offset])
                 skip = TRUE
                 col = 0
                 for c in viml_split(lines[lnum + 1], "\\zs"):
                     if skip:
+                        viml_add(self.buf, "<SKIP>:" + c)
+                        viml_add(self.pos, [lnum + 2, col + 1, offset])
                         if c == "\\":
                             skip = FALSE
                     else:
@@ -3303,11 +3415,21 @@ class StringReader:
     def tell(self):
         return self.i
 
+    def skip_continue(self):
+        if self.join:
+            while self.i < viml_len(self.buf) and viml_eqregh(self.buf[self.i], "^<SKIP>:"):
+                self.i += 1
+
+    def value_at(self, i):
+        return viml_substitute(self.buf[i], "^<SKIP>:", "", "")
+
     def seek_set(self, i):
         self.i = i
+        self.skip_continue()
 
     def seek_cur(self, i):
         self.i = self.i + i
+        self.skip_continue()
 
     def seek_end(self, i):
         self.i = viml_len(self.buf) + i
@@ -3315,18 +3437,26 @@ class StringReader:
     def p(self, i):
         if self.i >= viml_len(self.buf):
             return "<EOF>"
-        return self.buf[self.i + i]
+        r = self.i
+        j = i
+        while j > 0:
+            r += 1
+            if not self.join or not viml_eqregh(self.buf[r], "^<SKIP>:"):
+                j -= 1
+        return self.value_at(r)
 
     def peek(self):
         if self.i >= viml_len(self.buf):
             return "<EOF>"
-        return self.buf[self.i]
+        return self.value_at(self.i)
 
     def get(self):
         if self.i >= viml_len(self.buf):
             return "<EOF>"
+        c = self.value_at(self.i)
         self.i += 1
-        return self.buf[self.i - 1]
+        self.skip_continue()
+        return c
 
     def peekn(self, n):
         pos = self.tell()
@@ -3338,11 +3468,12 @@ class StringReader:
         r = ""
         j = 0
         while self.i < viml_len(self.buf) and (n < 0 or j < n):
-            c = self.buf[self.i]
+            c = self.value_at(self.i)
             if c == "<EOL>":
                 break
             r += c
             self.i += 1
+            self.skip_continue()
             j += 1
         return r
 
@@ -3359,7 +3490,7 @@ class StringReader:
         for i in viml_range(begin.i, end.i - 1):
             if i >= viml_len(self.buf):
                 break
-            c = self.buf[i]
+            c = self.value_at(i)
             if c == "<EOL>":
                 c = "\n"
             r += c
@@ -3669,6 +3800,10 @@ class Compiler:
             return self.compile_blob(node)
         elif node.type == NODE_STRING:
             return self.compile_string(node)
+        elif node.type == NODE_CURLYSTRING:
+            return self.compile_curlystring(node)
+        elif node.type == NODE_CURLYSTRINGEXPR:
+            return self.compile_curlystringexpr(node)
         elif node.type == NODE_LIST:
             return self.compile_list(node)
         elif node.type == NODE_DICT:
@@ -4081,8 +4216,14 @@ class Compiler:
     def compile_curlynameexpr(self, node):
         return "{" + self.compile(node.value) + "}"
 
+    def compile_curlystring(self, node):
+        return viml_join([self.compile(vval) for vval in node.value], "")
+
+    def compile_curlystringexpr(self, node):
+        return "{" + self.compile(node.value) + "}"
+
     def escape_string(self, str):
-        m = AttributeDict({"\n": "\\n", "\t": "\\t", "\r": "\\r"})
+        m = AttributeDict({"\n": "\\n", "\t": "\\t", "\r": "\\r", "\\": "\\\\"})
         out = "\""
         for i in viml_range(viml_len(str)):
             c = str[i]
@@ -4092,6 +4233,13 @@ class Compiler:
                 out += c
         out += "\""
         return out
+
+    def escape_string2(self, node):
+        #{{{
+        if node.type == NODE_STRING:
+            return self.escape_string(node.value)
+        else:
+            return "$" + self.escape_string(self.compile_curlystring(node))
 
     def compile_lambda(self, node):
         rlist = [self.compile(vval) for vval in node.rlist]
@@ -4105,7 +4253,7 @@ class Compiler:
         if viml_empty(node.body):
             body = "(list)"
         else:
-            body = "(list " + viml_join([self.escape_string(vval.value) for vval in node.body], " ") + ")"
+            body = "(list " + viml_join([self.escape_string2(vval) for vval in node.body], " ") + ")"
         op = self.escape_string(node.op)
         return viml_printf("(heredoc %s %s %s)", rlist, op, body)
 
