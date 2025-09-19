@@ -57,6 +57,8 @@ let s:opprec[s:NODE_IDENTIFIER] = 9
 let s:opprec[s:NODE_CURLYNAME] = 9
 let s:opprec[s:NODE_ENV] = 9
 let s:opprec[s:NODE_REG] = 9
+let s:opprec[s:NODE_CURLYSTRING] = 9
+let s:opprec[s:NODE_CURLYSTRINGEXPR] = 9
 
 let s:JavascriptCompiler = {}
 

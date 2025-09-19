@@ -87,6 +87,7 @@ var pat_vim2js = {
   "^[0-9A-Fa-f][0-9A-Fa-f]$" : "^[0-9A-Fa-f][0-9A-Fa-f]$",
   "^\\.[0-9A-Fa-f]$" : "^\\.[0-9A-Fa-f]$",
   "^[0-9A-Fa-f][^0-9A-Fa-f]$" : "^[0-9A-Fa-f][^0-9A-Fa-f]$",
+  "^<SKIP>:" : "^(<SKIP>:)?(.*)",
 }
 
 function viml_add(lst, item) {
@@ -122,6 +123,11 @@ function viml_eqregh(s, reg) {
 function viml_eqregq(s, reg) {
     var mx = new RegExp(pat_vim2js[reg], "i");
     return mx.exec(s) != null;
+}
+
+function viml_substitute(s, reg, repl, flags) {
+    var mx = new RegExp(pat_vim2js[reg]);
+    return mx.exec(s)[2];
 }
 
 function viml_escape(s, chars) {

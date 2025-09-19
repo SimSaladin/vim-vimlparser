@@ -87,6 +87,7 @@ var pat_vim2js = {
   "^[0-9A-Fa-f][0-9A-Fa-f]$" : "^[0-9A-Fa-f][0-9A-Fa-f]$",
   "^\\.[0-9A-Fa-f]$" : "^\\.[0-9A-Fa-f]$",
   "^[0-9A-Fa-f][^0-9A-Fa-f]$" : "^[0-9A-Fa-f][^0-9A-Fa-f]$",
+  "^<SKIP>:" : "^(<SKIP>:)?(.*)",
 }
 
 function viml_add(lst, item) {
@@ -122,6 +123,11 @@ function viml_eqregh(s, reg) {
 function viml_eqregq(s, reg) {
     var mx = new RegExp(pat_vim2js[reg], "i");
     return mx.exec(s) != null;
+}
+
+function viml_substitute(s, reg, repl, flags) {
+    var mx = new RegExp(pat_vim2js[reg]);
+    return mx.exec(s)[2];
 }
 
 function viml_escape(s, chars) {
@@ -324,6 +330,8 @@ var NODE_EVAL = 95;
 var NODE_HEREDOC = 96;
 var NODE_METHOD = 97;
 var NODE_ECHOCONSOLE = 98;
+var NODE_CURLYSTRING = 99;
+var NODE_CURLYSTRINGEXPR = 100;
 var TOKEN_EOF = 1;
 var TOKEN_EOL = 2;
 var TOKEN_SPACE = 3;
@@ -1813,6 +1821,7 @@ VimLParser.prototype.parse_heredoc = function(prefix) {
     node.body = [];
     // allow prefix to precede heredoc end marker if true
     var is_trim = FALSE;
+    var is_eval = FALSE;
     while (TRUE) {
         this.reader.skip_white();
         var pos = this.reader.getpos();
@@ -1832,14 +1841,19 @@ VimLParser.prototype.parse_heredoc = function(prefix) {
             if (key == "trim") {
                 var is_trim = TRUE;
             }
+            else if (key == "eval") {
+                var is_eval = TRUE;
+            }
         }
     }
     if (node.op == "") {
         throw Err("E172: Missing marker", this.reader.getpos());
     }
     this.parse_trail();
+    this.reader.join = FALSE;
     while (TRUE) {
         if (this.reader.peek() == "<EOF>") {
+            this.reader.join = TRUE;
             break;
         }
         var pos = this.reader.getpos();
@@ -1847,11 +1861,17 @@ VimLParser.prototype.parse_heredoc = function(prefix) {
         if (line == node.op || is_trim && line == prefix + node.op) {
             return node;
         }
-        var linenode = Node(NODE_STRING);
-        linenode.pos = pos;
-        linenode.value = line;
+        if (!is_eval) {
+            var linenode = Node(NODE_STRING);
+            linenode.pos = pos;
+            linenode.value = line;
+            this.reader.get();
+        }
+        else {
+            this.reader.setpos(pos);
+            var linenode = new ExprParser(this.reader).parse_string("", "", TRUE, FALSE);
+        }
         viml_add(node.body, linenode);
-        this.reader.get();
     }
     throw Err(viml_printf("E990: Missing end marker '%s'", node.op), this.reader.getpos());
 }
@@ -2829,9 +2849,19 @@ ExprTokenizer.prototype.get2 = function() {
         return this.token(TOKEN_DQUOTE, "\"", pos);
     }
     else if (c == "$") {
-        var s = r.getn(1);
-        s += r.read_word();
-        return this.token(TOKEN_ENV, s, pos);
+        if (r.p(1) == "\"") {
+            r.seek_cur(2);
+            return this.token(TOKEN_DQUOTE, "$\"", pos);
+        }
+        else if (r.p(1) == "'") {
+            r.seek_cur(2);
+            return this.token(TOKEN_SQUOTE, "$'", pos);
+        }
+        else {
+            var s = r.getn(1);
+            s += r.read_word();
+            return this.token(TOKEN_ENV, s, pos);
+        }
     }
     else if (c == "@") {
         // @<EOL> is treated as @"
@@ -2864,7 +2894,7 @@ ExprTokenizer.prototype.get2 = function() {
         return this.token(TOKEN_BACKTICK, "`", pos);
     }
     else {
-        throw Err(viml_printf("unexpected character: %s", c), this.reader.getpos());
+        throw Err(viml_printf("get2: unexpected character: %s", c), this.reader.getpos());
     }
 }
 
@@ -3525,6 +3555,8 @@ ExprParser.prototype.parse_rlist = function() {
 // expr9: number
 //        "string"
 //        'string'
+//        $"st{ri}ng"
+//        $'st{ri}ng'
 //        [expr1, ...]
 //        {expr1: expr1, ...}
 //        #{literal_key1: expr1, ...}
@@ -3550,6 +3582,10 @@ ExprParser.prototype.parse_expr9 = function() {
         var node = Node(NODE_BLOB);
         node.pos = token.pos;
         node.value = token.value;
+    }
+    else if ((token.type == TOKEN_DQUOTE || token.type == TOKEN_SQUOTE) && token.value[0] == "$") {
+        this.reader.setpos(token.pos);
+        var node = this.parse_string(token.value, token.value[viml_len(token.value) - 1], token.value[0] == "$", TRUE);
     }
     else if (token.type == TOKEN_DQUOTE) {
         this.reader.seek_set(pos);
@@ -3881,6 +3917,109 @@ ExprParser.prototype.parse_curly_parts = function() {
     return curly_parts;
 }
 
+ExprParser.prototype.parse_string = function(open, quotechr, eval, multiline) {
+    var parts = [];
+    var pos = this.reader.getpos();
+    var s = open;
+    this.reader.seek_cur(viml_len(open));
+    while (TRUE) {
+        var c = this.reader.p(0);
+        if (c == "<EOF>") {
+            throw Err("unexpected EOF", this.reader.getpos());
+        }
+        else if (c == "<EOL>") {
+            if (quotechr != "") {
+                throw Err(viml_printf("string (%s): unexpected EOL", quotechr), this.reader.getpos());
+            }
+            else {
+                this.reader.seek_cur(1);
+                break;
+            }
+        }
+        else if (c == quotechr) {
+            this.reader.seek_cur(1);
+            if (this.reader.p(0) == quotechr) {
+                this.reader.seek_cur(1);
+                s += quotechr + quotechr;
+            }
+            else {
+                break;
+            }
+        }
+        else if (c == "\\" && quotechr == "\"") {
+            this.reader.seek_cur(1);
+            var c = this.reader.p(0);
+            if (c == "<EOF>" || c == "<EOL>") {
+                throw Err("ExprTokenizer: unexpected EOL", this.reader.getpos());
+            }
+            this.reader.seek_cur(1);
+            s += "\\" + c;
+        }
+        else if (c == "{" && eval) {
+            this.reader.seek_cur(1);
+            if (this.reader.p(0) == "{") {
+                this.reader.seek_cur(1);
+                s += "{{";
+            }
+            else {
+                // literal string part
+                if (!viml_empty(s)) {
+                    var node = Node(NODE_STRING);
+                    node.pos = pos;
+                    node.value = s;
+                    viml_add(parts, node);
+                    var s = "";
+                }
+                // {curlyexpr}
+                var node = Node(NODE_CURLYSTRINGEXPR);
+                node.pos = this.reader.getpos();
+                node.value = this.parse_expr1();
+                viml_add(parts, node);
+                this.reader.skip_white();
+                var c = this.reader.p(0);
+                if (c != "}") {
+                    throw Err(viml_printf("unexpected token: %s (expected })", c), this.reader.getpos());
+                }
+                if (!multiline && this.reader.getpos().lnum != node.pos.lnum) {
+                    throw Err(viml_printf("interpolated expression in heredoc may not span multiple lines"), node.pos);
+                }
+                this.reader.seek_cur(1);
+                var pos = this.reader.getpos();
+            }
+        }
+        else if (c == "}" && eval) {
+            this.reader.seek_cur(1);
+            if (this.reader.p(0) != "}") {
+                throw Err(viml_printf("unexpected character: %s (expected })", c), this.reader.getpos());
+            }
+            this.reader.seek_cur(1);
+            s += "}}";
+        }
+        else {
+            this.reader.seek_cur(1);
+            s += c;
+        }
+    }
+    s += quotechr;
+    if (!viml_empty(s) || viml_len(parts) == 0) {
+        // add literal part
+        var node = Node(NODE_STRING);
+        node.pos = pos;
+        node.value = s;
+        viml_add(parts, node);
+    }
+    this.tokenizer.reader.seek_set(this.reader.tell());
+    if (viml_len(parts) == 1) {
+        return parts[0];
+    }
+    else {
+        var node = Node(NODE_CURLYSTRING);
+        node.pos = parts[0].pos;
+        node.value = parts;
+        return node;
+    }
+}
+
 function LvalueParser() { ExprParser.apply(this, arguments); this.__init__.apply(this, arguments); }
 LvalueParser.prototype = Object.create(ExprParser.prototype);
 LvalueParser.prototype.parse = function() {
@@ -4009,6 +4148,7 @@ function StringReader() { this.__init__.apply(this, arguments); }
 StringReader.prototype.__init__ = function(lines) {
     this.buf = [];
     this.pos = [];
+    this.join = TRUE;
     var lnum = 0;
     var offset = 0;
     while (lnum < viml_len(lines)) {
@@ -4022,12 +4162,16 @@ StringReader.prototype.__init__ = function(lines) {
             offset += viml_len(c);
         }
         while (lnum + 1 < viml_len(lines) && viml_eqregh(lines[lnum + 1], "^\\s*\\\\")) {
+            viml_add(this.buf, "<SKIP>:<EOL>");
+            viml_add(this.pos, [lnum + 1, col + 1, offset]);
             var skip = TRUE;
             var col = 0;
             var __c8 = viml_split(lines[lnum + 1], "\\zs");
             for (var __i8 = 0; __i8 < __c8.length; ++__i8) {
                 var c = __c8[__i8];
                 if (skip) {
+                    viml_add(this.buf, "<SKIP>:" + c);
+                    viml_add(this.pos, [lnum + 2, col + 1, offset]);
                     if (c == "\\") {
                         var skip = FALSE;
                     }
@@ -4060,12 +4204,26 @@ StringReader.prototype.tell = function() {
     return this.i;
 }
 
+StringReader.prototype.skip_continue = function() {
+    if (this.join) {
+        while (this.i < viml_len(this.buf) && viml_eqregh(this.buf[this.i], "^<SKIP>:")) {
+            this.i += 1;
+        }
+    }
+}
+
+StringReader.prototype.value_at = function(i) {
+    return viml_substitute(this.buf[i], "^<SKIP>:", "", "");
+}
+
 StringReader.prototype.seek_set = function(i) {
     this.i = i;
+    this.skip_continue();
 }
 
 StringReader.prototype.seek_cur = function(i) {
     this.i = this.i + i;
+    this.skip_continue();
 }
 
 StringReader.prototype.seek_end = function(i) {
@@ -4076,22 +4234,32 @@ StringReader.prototype.p = function(i) {
     if (this.i >= viml_len(this.buf)) {
         return "<EOF>";
     }
-    return this.buf[this.i + i];
+    var r = this.i;
+    var j = i;
+    while (j > 0) {
+        r += 1;
+        if (!this.join || !viml_eqregh(this.buf[r], "^<SKIP>:")) {
+            j -= 1;
+        }
+    }
+    return this.value_at(r);
 }
 
 StringReader.prototype.peek = function() {
     if (this.i >= viml_len(this.buf)) {
         return "<EOF>";
     }
-    return this.buf[this.i];
+    return this.value_at(this.i);
 }
 
 StringReader.prototype.get = function() {
     if (this.i >= viml_len(this.buf)) {
         return "<EOF>";
     }
+    var c = this.value_at(this.i);
     this.i += 1;
-    return this.buf[this.i - 1];
+    this.skip_continue();
+    return c;
 }
 
 StringReader.prototype.peekn = function(n) {
@@ -4105,12 +4273,13 @@ StringReader.prototype.getn = function(n) {
     var r = "";
     var j = 0;
     while (this.i < viml_len(this.buf) && (n < 0 || j < n)) {
-        var c = this.buf[this.i];
+        var c = this.value_at(this.i);
         if (c == "<EOL>") {
             break;
         }
         r += c;
         this.i += 1;
+        this.skip_continue();
         j += 1;
     }
     return r;
@@ -4134,7 +4303,7 @@ StringReader.prototype.getstr = function(begin, end) {
         if (i >= viml_len(this.buf)) {
             break;
         }
-        var c = this.buf[i];
+        var c = this.value_at(i);
         if (c == "<EOL>") {
             var c = "\n";
         }
@@ -4568,6 +4737,12 @@ Compiler.prototype.compile = function(node) {
     }
     else if (node.type == NODE_STRING) {
         return this.compile_string(node);
+    }
+    else if (node.type == NODE_CURLYSTRING) {
+        return this.compile_curlystring(node);
+    }
+    else if (node.type == NODE_CURLYSTRINGEXPR) {
+        return this.compile_curlystringexpr(node);
     }
     else if (node.type == NODE_LIST) {
         return this.compile_list(node);
@@ -5123,8 +5298,16 @@ Compiler.prototype.compile_curlynameexpr = function(node) {
     return "{" + this.compile(node.value) + "}";
 }
 
+Compiler.prototype.compile_curlystring = function(node) {
+    return viml_join(node.value.map((function(vval) { return this.compile(vval); }).bind(this)), "");
+}
+
+Compiler.prototype.compile_curlystringexpr = function(node) {
+    return "{" + this.compile(node.value) + "}";
+}
+
 Compiler.prototype.escape_string = function(str) {
-    var m = {"\n":"\\n", "\t":"\\t", "\r":"\\r"};
+    var m = {"\n":"\\n", "\t":"\\t", "\r":"\\r", "\\":"\\\\"};
     var out = "\"";
     var __c14 = viml_range(viml_len(str));
     for (var __i14 = 0; __i14 < __c14.length; ++__i14) {
@@ -5139,6 +5322,16 @@ Compiler.prototype.escape_string = function(str) {
     }
     out += "\"";
     return out;
+}
+
+Compiler.prototype.escape_string2 = function(node) {
+    //{{{
+    if (node.type == NODE_STRING) {
+        return this.escape_string(node.value);
+    }
+    else {
+        return "$" + this.escape_string(this.compile_curlystring(node));
+    }
 }
 
 Compiler.prototype.compile_lambda = function(node) {
@@ -5157,7 +5350,7 @@ Compiler.prototype.compile_heredoc = function(node) {
         var body = "(list)";
     }
     else {
-        var body = "(list " + viml_join(node.body.map((function(vval) { return this.escape_string(vval.value); }).bind(this)), " ") + ")";
+        var body = "(list " + viml_join(node.body.map((function(vval) { return this.escape_string2(vval); }).bind(this)), " ") + ")";
     }
     var op = this.escape_string(node.op);
     return viml_printf("(heredoc %s %s %s)", rlist, op, body);
