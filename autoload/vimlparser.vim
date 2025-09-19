@@ -143,6 +143,8 @@ let s:NODE_EVAL = 95
 let s:NODE_HEREDOC = 96
 let s:NODE_METHOD = 97
 let s:NODE_ECHOCONSOLE = 98
+let s:NODE_CURLYSTRING = 99
+let s:NODE_CURLYSTRINGEXPR = 100
 
 let s:TOKEN_EOF = 1
 let s:TOKEN_EOL = 2
@@ -1518,6 +1520,7 @@ function! s:VimLParser.parse_heredoc(prefix) abort
 
   " allow prefix to precede heredoc end marker if true
   let is_trim = s:FALSE
+  let is_eval = s:FALSE
   while s:TRUE
     call self.reader.skip_white()
     let pos = self.reader.getpos()
@@ -1535,6 +1538,8 @@ function! s:VimLParser.parse_heredoc(prefix) abort
       call add(node.rlist, keynode)
       if key ==# 'trim'
         let is_trim = s:TRUE
+      elseif key ==# 'eval'
+        let is_eval = s:TRUE
       endif
     endif
   endwhile
@@ -1542,8 +1547,10 @@ function! s:VimLParser.parse_heredoc(prefix) abort
     throw s:Err('E172: Missing marker', self.reader.getpos())
   endif
   call self.parse_trail()
+  let self.reader.join = s:FALSE
   while s:TRUE
     if self.reader.peek() ==# '<EOF>'
+      let self.reader.join = s:TRUE
       break
     endif
     let pos = self.reader.getpos()
@@ -1551,11 +1558,16 @@ function! s:VimLParser.parse_heredoc(prefix) abort
     if line ==# node.op || is_trim && line ==# a:prefix . node.op
       return node
     endif
-    let linenode = s:Node(s:NODE_STRING)
-    let linenode.pos = pos
-    let linenode.value = line
+    if !is_eval
+      let linenode = s:Node(s:NODE_STRING)
+      let linenode.pos = pos
+      let linenode.value = line
+      call self.reader.get()
+    else
+      call self.reader.setpos(pos)
+      let linenode = s:ExprParser.new(self.reader).parse_string('', '', s:TRUE, s:FALSE)
+    endif
     call add(node.body, linenode)
-    call self.reader.get()
   endwhile
   throw s:Err(printf("E990: Missing end marker '%s'", node.op), self.reader.getpos())
 endfunction
@@ -3616,9 +3628,17 @@ function! s:ExprTokenizer.get2() abort
     call r.seek_cur(1)
     return self.token(s:TOKEN_DQUOTE, '"', pos)
   elseif c ==# '$'
-    let s = r.getn(1)
-    let s .= r.read_word()
-    return self.token(s:TOKEN_ENV, s, pos)
+    if r.p(1) ==# '"'
+      call r.seek_cur(2)
+      return self.token(s:TOKEN_DQUOTE, '$"', pos)
+    elseif r.p(1) ==# "'"
+      call r.seek_cur(2)
+      return self.token(s:TOKEN_SQUOTE, "$'", pos)
+    else
+      let s = r.getn(1)
+      let s .= r.read_word()
+      return self.token(s:TOKEN_ENV, s, pos)
+    endif
   elseif c ==# '@'
     " @<EOL> is treated as @"
     return self.token(s:TOKEN_REG, r.getn(2), pos)
@@ -3643,7 +3663,7 @@ function! s:ExprTokenizer.get2() abort
     call r.seek_cur(1)
     return self.token(s:TOKEN_BACKTICK, '`', pos)
   else
-    throw s:Err(printf('unexpected character: %s', c), self.reader.getpos())
+    throw s:Err(printf('get2: unexpected character: %s', c), self.reader.getpos())
   endif
 endfunction
 
@@ -4250,6 +4270,8 @@ endfunction
 " expr9: number
 "        "string"
 "        'string'
+"        $"st{ri}ng"
+"        $'st{ri}ng'
 "        [expr1, ...]
 "        {expr1: expr1, ...}
 "        #{literal_key1: expr1, ...}
@@ -4274,6 +4296,9 @@ function! s:ExprParser.parse_expr9() abort
     let node = s:Node(s:NODE_BLOB)
     let node.pos = token.pos
     let node.value = token.value
+  elseif (token.type ==# s:TOKEN_DQUOTE || token.type ==# s:TOKEN_SQUOTE) && token.value[0] ==# '$'
+    call self.reader.setpos(token.pos)
+    let node = self.parse_string(token.value, token.value[len(token.value)-1], token.value[0] ==# '$', s:TRUE)
   elseif token.type ==# s:TOKEN_DQUOTE
     call self.reader.seek_set(pos)
     let node = s:Node(s:NODE_STRING)
@@ -4574,6 +4599,100 @@ function! s:ExprParser.parse_curly_parts() abort
   return curly_parts
 endfunction
 
+function! s:ExprParser.parse_string(open, quotechr, eval, multiline) abort
+  let parts = []
+  let pos = self.reader.getpos()
+  let s = a:open
+  call self.reader.seek_cur(len(a:open))
+  while s:TRUE
+    let c = self.reader.p(0)
+    if c ==# '<EOF>'
+      throw s:Err('unexpected EOF', self.reader.getpos())
+    elseif c ==# '<EOL>'
+      if a:quotechr !=# ''
+        throw s:Err(printf('string (%s): unexpected EOL', a:quotechr), self.reader.getpos())
+      else
+        call self.reader.seek_cur(1)
+        break
+      endif
+    elseif c ==# a:quotechr
+      call self.reader.seek_cur(1)
+      if self.reader.p(0) ==# a:quotechr
+        call self.reader.seek_cur(1)
+        let s .= a:quotechr .. a:quotechr
+      else
+        break
+      endif
+    elseif c ==# '\' && a:quotechr ==# '"'
+      call self.reader.seek_cur(1)
+      let c = self.reader.p(0)
+      if c ==# '<EOF>' || c ==# '<EOL>'
+        throw s:Err('ExprTokenizer: unexpected EOL', self.reader.getpos())
+      endif
+      call self.reader.seek_cur(1)
+      let s .= '\' .. c
+    elseif c ==# '{' && a:eval
+      call self.reader.seek_cur(1)
+      if self.reader.p(0) ==# '{'
+        call self.reader.seek_cur(1)
+        let s .= '{{'
+      else
+        " literal string part
+        if !empty(s)
+          let node = s:Node(s:NODE_STRING)
+          let node.pos = pos
+          let node.value = s
+          call add(parts, node)
+          let s = ''
+        endif
+        " {curlyexpr}
+        let node = s:Node(s:NODE_CURLYSTRINGEXPR)
+        let node.pos = self.reader.getpos()
+        let node.value = self.parse_expr1()
+        call add(parts, node)
+        call self.reader.skip_white()
+        let c = self.reader.p(0)
+        if c !=# '}'
+          throw s:Err(printf('unexpected token: %s (expected })', c), self.reader.getpos())
+        endif
+        if !a:multiline && self.reader.getpos().lnum != node.pos.lnum
+          throw s:Err(printf('interpolated expression in heredoc may not span multiple lines'), node.pos)
+        endif
+        call self.reader.seek_cur(1)
+        let pos = self.reader.getpos()
+      endif
+    elseif c ==# '}' && a:eval
+      call self.reader.seek_cur(1)
+      if self.reader.p(0) !=# '}'
+        throw s:Err(printf('unexpected character: %s (expected })', c), self.reader.getpos())
+      endif
+      call self.reader.seek_cur(1)
+      let s .= '}}'
+    else
+      call self.reader.seek_cur(1)
+      let s .= c
+    endif
+  endwhile
+
+  let s .= a:quotechr
+  if !empty(s) || len(parts) ==# 0
+    " add literal part
+    let node = s:Node(s:NODE_STRING)
+    let node.pos = pos
+    let node.value = s
+    call add(parts, node)
+  endif
+  call self.tokenizer.reader.seek_set(self.reader.tell())
+  if len(parts) ==# 1
+    return parts[0]
+  else
+    let node = s:Node(s:NODE_CURLYSTRING)
+    let node.pos = parts[0].pos
+    let node.value = parts
+    return node
+  endif
+endfunction
+
 let s:LvalueParser = copy(s:ExprParser)
 
 function! s:LvalueParser.parse() abort
@@ -4699,6 +4818,7 @@ endfunction
 function! s:StringReader.__init__(lines) abort
   let self.buf = []
   let self.pos = []
+  let self.join = s:TRUE
   let lnum = 0
   let offset = 0
   while lnum < len(a:lines)
@@ -4710,10 +4830,14 @@ function! s:StringReader.__init__(lines) abort
       let offset += len(c)
     endfor
     while lnum + 1 < len(a:lines) && a:lines[lnum + 1] =~# '^\s*\\'
+      call add(self.buf, '<SKIP>:<EOL>')
+      call add(self.pos, [lnum + 1, col + 1, offset])
       let skip = s:TRUE
       let col = 0
       for c in split(a:lines[lnum + 1], '\zs')
         if skip
+          call add(self.buf, '<SKIP>:' .. c)
+          call add(self.pos, [lnum + 2, col + 1, offset])
           if c ==# '\'
             let skip = s:FALSE
           endif
@@ -4745,12 +4869,26 @@ function! s:StringReader.tell() abort
   return self.i
 endfunction
 
+function! s:StringReader.skip_continue() abort
+  if self.join
+    while self.i < len(self.buf) && self.buf[self.i] =~# '^<SKIP>:'
+      let self.i += 1
+    endwhile
+  endif
+endfunction
+
+function! s:StringReader.value_at(i) abort
+  return substitute(self.buf[a:i], '^<SKIP>:', '', '')
+endfunction
+
 function! s:StringReader.seek_set(i) abort
   let self.i = a:i
+  call self.skip_continue()
 endfunction
 
 function! s:StringReader.seek_cur(i) abort
   let self.i = self.i + a:i
+  call self.skip_continue()
 endfunction
 
 function! s:StringReader.seek_end(i) abort
@@ -4761,22 +4899,32 @@ function! s:StringReader.p(i) abort
   if self.i >= len(self.buf)
     return '<EOF>'
   endif
-  return self.buf[self.i + a:i]
+  let r = self.i
+  let j = a:i
+  while j > 0
+    let r += 1
+    if !self.join || self.buf[r] !~# '^<SKIP>:'
+      let j -= 1
+    endif
+  endwhile
+  return self.value_at(r)
 endfunction
 
 function! s:StringReader.peek() abort
   if self.i >= len(self.buf)
     return '<EOF>'
   endif
-  return self.buf[self.i]
+  return self.value_at(self.i)
 endfunction
 
 function! s:StringReader.get() abort
   if self.i >= len(self.buf)
     return '<EOF>'
   endif
+  let c = self.value_at(self.i)
   let self.i += 1
-  return self.buf[self.i - 1]
+  call self.skip_continue()
+  return c
 endfunction
 
 function! s:StringReader.peekn(n) abort
@@ -4790,12 +4938,13 @@ function! s:StringReader.getn(n) abort
   let r = ''
   let j = 0
   while self.i < len(self.buf) && (a:n < 0 || j < a:n)
-    let c = self.buf[self.i]
+    let c = self.value_at(self.i)
     if c ==# '<EOL>'
       break
     endif
     let r .= c
     let self.i += 1
+    call self.skip_continue()
     let j += 1
   endwhile
   return r
@@ -4817,7 +4966,7 @@ function! s:StringReader.getstr(begin, end) abort
     if i >= len(self.buf)
       break
     endif
-    let c = self.buf[i]
+    let c = self.value_at(i)
     if c ==# '<EOL>'
       let c = "\n"
     endif
@@ -5173,6 +5322,10 @@ function! s:Compiler.compile(node) abort
     return self.compile_blob(a:node)
   elseif a:node.type ==# s:NODE_STRING
     return self.compile_string(a:node)
+  elseif a:node.type ==# s:NODE_CURLYSTRING
+    return self.compile_curlystring(a:node)
+  elseif a:node.type ==# s:NODE_CURLYSTRINGEXPR
+    return self.compile_curlystringexpr(a:node)
   elseif a:node.type ==# s:NODE_LIST
     return self.compile_list(a:node)
   elseif a:node.type ==# s:NODE_DICT
@@ -5697,8 +5850,16 @@ function! s:Compiler.compile_curlynameexpr(node) abort
   return '{' . self.compile(a:node.value) . '}'
 endfunction
 
+function! s:Compiler.compile_curlystring(node) abort
+  return join(map(a:node.value, 'self.compile(v:val)'), '')
+endfunction
+
+function! s:Compiler.compile_curlystringexpr(node) abort
+  return '{' . self.compile(a:node.value) . '}'
+endfunction
+
 function! s:Compiler.escape_string(str) abort
-  let m = {"\n": '\n', "\t": '\t', "\r": '\r'}
+  let m = {"\n": '\n', "\t": '\t', "\r": '\r', "\\": '\\'}
   let out = '"'
   for i in range(len(a:str))
     let c = a:str[i]
@@ -5711,6 +5872,14 @@ function! s:Compiler.escape_string(str) abort
   let out .= '"'
   return out
 endfunction
+
+function! s:Compiler.escape_string2(node) abort "{{{
+  if a:node.type == s:NODE_STRING
+    return self.escape_string(a:node.value)
+  else
+    return '$' .. self.escape_string(self.compile_curlystring(a:node))
+  endif
+endfunction "}}}
 
 function! s:Compiler.compile_lambda(node) abort
   let rlist = map(a:node.rlist, 'self.compile(v:val)')
@@ -5726,7 +5895,7 @@ function! s:Compiler.compile_heredoc(node) abort
   if empty(a:node.body)
     let body = '(list)'
   else
-    let body = '(list ' . join(map(a:node.body, 'self.escape_string(v:val.value)'), ' ') . ')'
+    let body = '(list ' . join(map(a:node.body, 'self.escape_string2(v:val)'), ' ') . ')'
   endif
   let op = self.escape_string(a:node.op)
   return printf('(heredoc %s %s %s)', rlist, op, body)

@@ -33,3 +33,8 @@ EOS
 	  hello
 		world
 EOS
+" line continuations are not interpreted inside heredocs
+let a =<< EOS
+hello
+ \ world
+EOS

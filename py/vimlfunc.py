@@ -91,6 +91,7 @@ pat_vim2py = {
     r"^\.[0-9A-Fa-f]$": r"^\.[0-9A-Fa-f]$",
     "^[0-9A-Fa-f][^0-9A-Fa-f]$": "^[0-9A-Fa-f][^0-9A-Fa-f]$",
     "^[^a-z]\\S\\+$": "^[^a-z]\\S\\+$",
+    "^<SKIP>:": "^<SKIP>:",
 }
 
 
@@ -124,6 +125,9 @@ def viml_eqregh(s, reg):
 
 def viml_eqregq(s, reg):
     return re.search(pat_vim2py[reg], s, re.IGNORECASE)
+
+def viml_substitute(s, reg, repl, flags):
+    return re.sub(pat_vim2py[reg], repl, s)
 
 
 def viml_escape(s, chars):

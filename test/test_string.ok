@@ -1,0 +1,10 @@
+; test_string
+(echo "")
+(echo "foo{}bar")
+(echo 'foo{bar}')
+(echo $"foo{bar}ba{(f 'z')}")
+(echo $'f{(concat o 'o')}')
+(echo (concat "line1 " "line2"))
+(echo $' {bob}')
+(echo (concat $'{"alice"} {{ }}' $" \{ {{"))
+(let =<< a (heredoc (list "trim" "eval") "END" (list $"  See the file {$HOME}/.vimrc")))

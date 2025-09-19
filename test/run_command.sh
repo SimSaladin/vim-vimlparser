@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 if [ $# -eq 0 ]; then
   echo "USAGE: ./test/run_command.sh <vimlparser command>"
